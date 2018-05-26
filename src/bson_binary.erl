@@ -70,6 +70,10 @@ put_field(N, {regex, Pat, Opt}) -> <<?put_tagname(11, N), (put_cstring(Pat))/bin
 put_field(N, {javascript, {}, Code}) -> <<?put_tagname(13, N), (put_string(Code))/binary>>;
 put_field(N, {javascript, Env, Code}) -> <<?put_tagname(15, N), (put_closure(Code, Env))/binary>>;
 put_field(N, {mongostamp, Inc, Time}) -> <<?put_tagname(17, N), ?put_int32(Inc), ?put_int32(Time)>>;
+put_field(N, {decimal, V}) ->
+	put_field(N, {decimal, V, 6});
+put_field(N, {decimal, V, D}) ->
+	<<?put_tagname(19, N), (put_decimal({decimal, V, D}))/binary>>;
 put_field(N, UnixTime = {_, _, _}) -> <<?put_tagname(9, N), (put_unixtime(UnixTime))/binary>>;
 put_field(N, V) when is_float(V) -> <<?put_tagname(1, N), ?put_float(V)>>;
 put_field(N, V) when is_binary(V) -> <<?put_tagname(2, N), (put_string(V))/binary>>;
@@ -130,9 +134,12 @@ get_field(<<17:8, _/binary>>, _, Bin1, _) ->
 get_field(<<18:8, _/binary>>, _, Bin1, _) ->
   <<?get_int64(N), Bin2/binary>> = Bin1,
   {N, Bin2};
+get_field(<<19:8, _/binary>>, _, Bin1, _) ->
+	<<Bin:16/binary, Bin2/binary>> = Bin1,
+	{get_decimal(Bin), Bin2};
 get_field(<<127:8, _/binary>>, _, Bin1, _) ->
   {'MAX_KEY', Bin1};
-get_field(<<255:8, _/binary>>, _, Bin1, _) ->
+get_field(<<255:8, _/binary>>, _, Bin1, _) -> 
   {'MIN_KEY', Bin1};
 get_field(<<Tag:8, Bin0/binary>>, _, _, _) ->
   erlang:error(unknown_bson_tag, [<<Tag:8, Bin0/binary>>]).
@@ -226,3 +233,46 @@ put_oid(<<Oid:12/binary>>) -> Oid.
 %% @private
 -spec get_oid(binary()) -> {<<_:96>>, binary()}.
 get_oid(<<Oid:12/binary, Bin/binary>>) -> {Oid, Bin}.
+
+%% @private
+-spec put_decimal({decimal, float, e}) -> <<_:128>>.
+put_decimal({decimal, 'NaN', _}) ->
+	<<0:120, 0:1, 3:2, 3:2, 4:3>>;
+put_decimal({decimal, 'Infinity', _}) ->
+	<<0:120, 0:1, 3:2, 3:2, 0:3>>;
+put_decimal({decimal, 'Inf', _}) ->
+	<<0:120, 0:1, 3:2, 3:2, 0:3>>;
+put_decimal({decimal, _, D}) when D > 6145 orelse D < -6145 ->
+	<<0:120, 0:1, 3:2, 3:2, 4:3>>;
+put_decimal({decimal, V, D}) when (is_float(V) orelse is_integer(V)) andalso is_integer(D) ->
+	{S, Digtal} = 
+		case V >= 0 of
+			true -> {0, erlang:round(math:pow(10, D) * V)};
+			false -> {1, -erlang:round(math:pow(10, D) * V)}
+		end,
+	E0 = 6176-D,
+	E7 = E0 bsr 7,
+	<<(Digtal):112/signed-little, E0:7, 0:1, S:1, E7:7>>.
+
+%% @private
+-spec get_decimal(<<_:128>>) -> {decimal, float, e}.
+get_decimal(<<Digtal:111/signed-little, D2:1, D1:8, S:1, B12:2, B34:2, B567:3>>) ->
+	{E, T} =
+		case {B12, B34} of
+			{3, 3} ->
+				{0, B567};
+			{3, _} ->
+				{(B34 bsl 12) bor (B567 bsl 9) bor (D1 bsl 1) bor (D2),
+				 Digtal};
+			{_, _} ->
+				{(B12 bsl 12) bor (B34 bsl 10) bor (B567 bsl 7) bor (D1 bsr 1),
+				 Digtal}
+		end,				
+	Decimal = 
+		case {E,T band 4} of
+			{0,4} -> 'NaN';
+			{0,0} -> 'Infinity';
+			_ when E >= 6176 -> math:pow(-1, S) * T * math:pow(10,E-6176);
+			_ when E < 6176 -> math:pow(-1, S) * T / math:pow(10,6176-E)
+		end,				
+  {decimal, Decimal, 6176-E}.
